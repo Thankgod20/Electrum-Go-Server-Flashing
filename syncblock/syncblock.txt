@@ -1,0 +1,221 @@
+package syncblock
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	"github.com/blockcypher/gobcy/v2"
+	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/go-redis/redis/v8"
+)
+
+const (
+	redisDB        = 0
+	blockInterval  = 10 * time.Minute
+	maxRetries     = 5
+	initialBackoff = 1 * time.Second
+)
+
+var ctx = context.Background()
+
+type SyncBlock struct {
+	blockcypherToken string
+	network          string
+	chain            string
+	redisAddr        string
+	redisPassword    string
+}
+type TransactionHistory struct {
+	Height int    `json:"height"`
+	TxHash string `json:"tx_hash"`
+}
+
+func NewSync(blockcypherToken, network, chain, redisAddr, redisPassword string) *SyncBlock {
+	return &SyncBlock{blockcypherToken: blockcypherToken, network: network, chain: chain, redisAddr: redisAddr, redisPassword: redisPassword}
+
+}
+func (s *SyncBlock) Initiate() {
+	client := redis.NewClient(&redis.Options{
+		Addr:     s.redisAddr,
+		Password: s.redisPassword,
+		DB:       redisDB,
+	})
+
+	bc := gobcy.API{Token: s.blockcypherToken, Coin: s.network, Chain: s.chain}
+	retries := 0
+	backoff := initialBackoff
+	for {
+		err := processLatestBlocks(&bc, client, retries)
+		if err != nil {
+			log.Printf("Error processing blocks: %v", err)
+		}
+		if isRateLimitError(err) {
+			log.Printf("Rate limit hit processLatestBlocks, retrying in %v...", backoff)
+			time.Sleep(backoff)
+			backoff *= 2
+			retries = -1
+			continue
+		}
+		retries += 1
+		time.Sleep(blockInterval)
+	}
+}
+
+func processLatestBlocks(bc *gobcy.API, client *redis.Client, retries int) error {
+	var latestBlock gobcy.Blockchain
+	if retries < maxRetries {
+		latestBlock_, err := bc.GetChain()
+		latestBlock = latestBlock_
+		fmt.Println("latestBlock", latestBlock)
+		if err != nil {
+			return fmt.Errorf("failed to get latest block: %w", err)
+		}
+	}
+	for i := 0; i < 20; i++ {
+
+		block, err := getBlockWithRetry(bc, latestBlock.Height-i)
+		if err != nil {
+			log.Printf("Failed to get block at height %d: %v", latestBlock.Height-i, err)
+			continue
+		}
+		err = processBlock(block, client, bc)
+		if err != nil {
+			log.Printf("Failed to process block at height %d: %v", latestBlock.Height-i, err)
+		}
+	}
+	return nil
+}
+func getBlockWithRetry(bc *gobcy.API, height int) (gobcy.Block, error) {
+	var block gobcy.Block
+	var err error
+	backoff := initialBackoff
+
+	for retries := 0; retries < maxRetries; retries++ {
+		block, err = bc.GetBlock(height, "", nil)
+		if err == nil {
+			return block, nil
+		}
+
+		if isRateLimitError(err) {
+			log.Printf("Rate limit hit getBlockWithRetry, retrying in %v...", backoff)
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
+		}
+		break
+	}
+
+	return block, err
+}
+func isRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check if error contains rate limit status code
+	if strings.Contains(err.Error(), "429") {
+		return true
+	}
+	return false
+}
+func processBlock(block gobcy.Block, client *redis.Client, bc *gobcy.API) error {
+	for _, txRef := range block.TXids {
+		tx, err := getTransactionWithRetry(bc, txRef) //getTransaction(txRef, block.Height, bc)
+		if err != nil {
+			log.Printf("Failed to get transaction %s: %v", txRef, err)
+			continue
+		}
+		fmt.Println("Transaction from block", tx)
+		for _, output := range tx.Outputs {
+			for _, address := range output.Addresses {
+				scripthash, err := getScriptHashFromAddress(address)
+				if err != nil {
+					log.Printf("Failed to get scripthash for address %s: %v", address, err)
+					continue
+				}
+				history := TransactionHistory{
+					Height: block.Height,
+					TxHash: tx.Hash,
+				}
+				err = updateRedis(client, scripthash, history)
+				if err != nil {
+					log.Printf("Failed to update Redis for scripthash %s: %v", scripthash, err)
+				}
+			}
+		}
+	}
+	return nil
+}
+func getTransactionWithRetry(bc *gobcy.API, txid string) (gobcy.TX, error) {
+	var tx gobcy.TX
+	var err error
+	backoff := initialBackoff
+
+	for retries := 0; retries < maxRetries; retries++ {
+		tx, err = bc.GetTX(txid, nil)
+		if err == nil {
+			return tx, nil
+		}
+
+		if isRateLimitError(err) {
+			log.Printf("Rate limit hit when fetching transaction %s, retrying in %v...", txid, backoff)
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
+		}
+		break
+	}
+
+	return tx, err
+}
+
+/*
+func getTransaction(txid string, height int, bc *gobcy.API) (gobcy.TX, error) {
+
+		tx, err := bc.GetTX(txid, nil)
+		if err != nil {
+			return tx, fmt.Errorf("failed to get transaction %s at height %d: %w", txid, height, err)
+		}
+		return tx, nil
+	}
+*/
+func getScriptHashFromAddress(address string) (string, error) {
+	addr, err := btcutil.DecodeAddress(address, &chaincfg.MainNetParams)
+	if err != nil {
+		return "", err
+	}
+	scripthash := btcutil.Hash160(addr.ScriptAddress())
+	return hex.EncodeToString(scripthash), nil
+}
+
+func updateRedis(client *redis.Client, scripthash string, history TransactionHistory) error {
+	historyJSON, err := json.Marshal(history)
+	if err != nil {
+		return err
+	}
+	return client.RPush(ctx, scripthash, historyJSON).Err()
+}
+
+func getHistory(client *redis.Client, scripthash string) ([]TransactionHistory, error) {
+	historyJSONs, err := client.LRange(ctx, scripthash, 0, -1).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	var history []TransactionHistory
+	for _, historyJSON := range historyJSONs {
+		var txHistory TransactionHistory
+		err := json.Unmarshal([]byte(historyJSON), &txHistory)
+		if err != nil {
+			return nil, err
+		}
+		history = append(history, txHistory)
+	}
+	return history, nil
+}
