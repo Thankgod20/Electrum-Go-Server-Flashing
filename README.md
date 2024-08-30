@@ -41,10 +41,10 @@ You can run the Bitcoin node server using the following This Link:
 4. **Run the Electrum Flashing Tool:**
 
    ```bash
-   ./ElectrumGoServerFlashing --rpc=127.0.0.1:18332 
+   ./ElectrumGoServerFlashing --rpc --url="127.0.0.1:18885" 
    ```
 
-   This command starts the flashing tool, connecting it to your local `miniBTCD` node on port `18332`.
+   This command starts the flashing tool, connecting it to your local `miniBTCD` node on port `18885`.
 
 ## Features
 
@@ -59,7 +59,7 @@ Once you've started the `miniBTCD` server and your Electrum wallet is connected,
 ## Example Commands
 
 ```bash
-./ElectrumGoServerFlashing --rpc=127.0.0.1:18332
+./ElectrumGoServerFlashing --rpc --url="127.0.0.1:18885"
 ```
 
 This command will flash 1.5 Bitcoin to the specified wallet address.
